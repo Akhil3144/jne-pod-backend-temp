@@ -1,5 +1,5 @@
 {
-  "sdkEnabled": true,
+  "sdkEnabled": false,
   "configVersion": "1.1",
   "refreshIntervalSeconds": 30,
   "photo": {
