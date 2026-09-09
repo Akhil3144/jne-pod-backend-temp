@@ -320,9 +320,1344 @@ async function load(){let y=scrollY;try{let res=await fetch('/api/pod',{cache:'n
 </script></body></html>'''
 
 
+
+# ============================================================
+# JNE POD SDK REMOTE CONFIGURATION
+# ============================================================
+
+import json
+from pathlib import Path
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+
+class SdkConfiguration(Base):
+    __tablename__ = "sdk_configuration"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    configVersion: Mapped[str] = mapped_column(String(32), nullable=False)
+    configJson: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    updatedAt: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False
+    )
+
+
+class SdkConfigAudit(Base):
+    __tablename__ = "sdk_config_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    configVersion: Mapped[str] = mapped_column(String(32), nullable=False)
+    changedAt: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False
+    )
+    changedBy: Mapped[str] = mapped_column(String(100), nullable=False)
+    configJson: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+# Existing create_all() ran before these models were defined.
+# Run it again; check-first semantics preserve existing tables/data.
+Base.metadata.create_all(bind=engine)
+
+
+def _bundled_sdk_config() -> dict[str, Any]:
+    path = Path(__file__).with_name("jne-pod-config.json")
+
+    if path.exists():
+        try:
+            value = json.loads(path.read_text())
+            if isinstance(value, dict):
+                return value
+        except Exception:
+            pass
+
+    return {
+        "sdkEnabled": True,
+        "configVersion": "1.1",
+        "refreshIntervalSeconds": 30,
+        "photo": {
+            "minWidth": 640,
+            "minHeight": 480,
+            "minFileSizeBytes": 10000,
+            "minBrightness": 45.0,
+            "minContrast": 10.0,
+            "minSharpness": 25.0,
+            "retakeOnDark": True,
+            "retakeOnBlur": True,
+            "retakeOnLowResolution": True,
+            "retakeOnLowContrast": True,
+        },
+        "person": {
+            "required": False,
+            "acceptPartial": True,
+            "acceptUncertain": True,
+            "minConfidence": 0.7,
+        },
+        "package": {
+            "required": True,
+            "minConfidence": 0.2,
+        },
+        "gps": {
+            "required": True,
+            "allowedDeliveryRadiusMeters": 250.0,
+            "requireDestinationPoint": False,
+        },
+        "locationEvidence": {
+            "required": False,
+            "acceptHouse": True,
+            "acceptGate": True,
+            "acceptBuilding": True,
+        },
+    }
+
+
+def _version_revision(version: str) -> int:
+    try:
+        parts = str(version).split(".")
+        if len(parts) >= 2:
+            return max(1, int(parts[1]))
+    except Exception:
+        pass
+    return 1
+
+
+def _get_sdk_config_row(db: Session) -> SdkConfiguration:
+    row = db.get(SdkConfiguration, 1)
+
+    if row is not None:
+        return row
+
+    config = _bundled_sdk_config()
+    version = str(config.get("configVersion") or "1.1")
+    revision = _version_revision(version)
+
+    row = SdkConfiguration(
+        id=1,
+        revision=revision,
+        configVersion=version,
+        configJson=config,
+        updatedAt=datetime.now(timezone.utc),
+    )
+
+    db.add(row)
+
+    db.add(
+        SdkConfigAudit(
+            configVersion=version,
+            changedAt=datetime.now(timezone.utc),
+            changedBy="SYSTEM_INITIAL_SEED",
+            configJson=config,
+        )
+    )
+
+    db.commit()
+    db.refresh(row)
+
+    return row
+
+
+def _bool(section: dict[str, Any], name: str, default: bool) -> bool:
+    value = section.get(name, default)
+
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false")
+
+    return value
+
+
+def _number(
+    section: dict[str, Any],
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    value = section.get(name, default)
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+
+    value = float(value)
+
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+
+    return value
+
+
+def _integer(
+    section: dict[str, Any],
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = section.get(name, default)
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be an integer")
+
+    value = int(value)
+
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+
+    return value
+
+
+def _normalize_sdk_config(
+    incoming: dict[str, Any],
+    version: str,
+) -> dict[str, Any]:
+
+    if not isinstance(incoming, dict):
+        raise ValueError("Configuration must be an object")
+
+    photo = incoming.get("photo") or {}
+    person = incoming.get("person") or {}
+    package = incoming.get("package") or {}
+    gps = incoming.get("gps") or {}
+    location = incoming.get("locationEvidence") or {}
+
+    for section in (photo, person, package, gps, location):
+        if not isinstance(section, dict):
+            raise ValueError("Invalid configuration section")
+
+    interval = _integer(
+        incoming,
+        "refreshIntervalSeconds",
+        30,
+        30,
+        86400,
+    )
+
+    return {
+        "sdkEnabled": _bool(
+            incoming,
+            "sdkEnabled",
+            True,
+        ),
+        "configVersion": version,
+        "refreshIntervalSeconds": interval,
+
+        "photo": {
+            "minWidth": _integer(
+                photo, "minWidth", 640, 1, 10000
+            ),
+            "minHeight": _integer(
+                photo, "minHeight", 480, 1, 10000
+            ),
+            "minFileSizeBytes": _integer(
+                photo,
+                "minFileSizeBytes",
+                10000,
+                0,
+                50000000,
+            ),
+            "minBrightness": _number(
+                photo,
+                "minBrightness",
+                45.0,
+                0.0,
+                255.0,
+            ),
+            "minContrast": _number(
+                photo,
+                "minContrast",
+                10.0,
+                0.0,
+                1000.0,
+            ),
+            "minSharpness": _number(
+                photo,
+                "minSharpness",
+                25.0,
+                0.0,
+                100000.0,
+            ),
+            "retakeOnDark": _bool(
+                photo, "retakeOnDark", True
+            ),
+            "retakeOnBlur": _bool(
+                photo, "retakeOnBlur", True
+            ),
+            "retakeOnLowResolution": _bool(
+                photo,
+                "retakeOnLowResolution",
+                True,
+            ),
+            "retakeOnLowContrast": _bool(
+                photo,
+                "retakeOnLowContrast",
+                True,
+            ),
+        },
+
+        "person": {
+            "required": _bool(
+                person, "required", False
+            ),
+            "acceptPartial": _bool(
+                person, "acceptPartial", True
+            ),
+            "acceptUncertain": _bool(
+                person,
+                "acceptUncertain",
+                True,
+            ),
+            "minConfidence": _number(
+                person,
+                "minConfidence",
+                0.7,
+                0.01,
+                1.0,
+            ),
+        },
+
+        "package": {
+            "required": _bool(
+                package, "required", True
+            ),
+            "minConfidence": _number(
+                package,
+                "minConfidence",
+                0.2,
+                0.01,
+                1.0,
+            ),
+        },
+
+        "gps": {
+            "required": _bool(
+                gps, "required", True
+            ),
+            "allowedDeliveryRadiusMeters": _number(
+                gps,
+                "allowedDeliveryRadiusMeters",
+                250.0,
+                1.0,
+                100000.0,
+            ),
+            "requireDestinationPoint": _bool(
+                gps,
+                "requireDestinationPoint",
+                False,
+            ),
+        },
+
+        "locationEvidence": {
+            "required": _bool(
+                location, "required", False
+            ),
+            "acceptHouse": _bool(
+                location, "acceptHouse", True
+            ),
+            "acceptGate": _bool(
+                location, "acceptGate", True
+            ),
+            "acceptBuilding": _bool(
+                location,
+                "acceptBuilding",
+                True,
+            ),
+        },
+    }
+
+
 @app.get("/sdk-config")
 def sdk_config():
-    import json
-    from pathlib import Path
-    config_path = Path(__file__).with_name("jne-pod-config.json")
-    return json.loads(config_path.read_text())
+    """
+    Public read-only endpoint used by the Android SDK.
+    Modification is never allowed through this endpoint.
+    """
+    with SessionLocal() as db:
+        row = _get_sdk_config_row(db)
+        return JSONResponse(content=row.configJson)
+
+
+@app.get("/config", response_class=HTMLResponse)
+def sdk_config_admin_page():
+    with SessionLocal() as db:
+        row = _get_sdk_config_row(db)
+
+        history = db.execute(
+            select(SdkConfigAudit)
+            .order_by(SdkConfigAudit.id.desc())
+            .limit(10)
+        ).scalars().all()
+
+        config_json = json.dumps(row.configJson)
+
+        history_html = "".join(
+            f"""
+            <tr>
+                <td>{item.configVersion}</td>
+                <td>{item.changedAt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</td>
+                <td>{item.changedBy}</td>
+            </tr>
+            """
+            for item in history
+        )
+
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JNE POD SDK Configuration</title>
+
+<style>
+* {{
+    box-sizing: border-box;
+}}
+
+body {{
+    margin: 0;
+    font-family:
+        Inter,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+    background: #f4f6f9;
+    color: #172033;
+}}
+
+.header {{
+    background: #ffffff;
+    border-bottom: 1px solid #dfe4ea;
+    padding: 22px 30px;
+}}
+
+.header h1 {{
+    margin: 0;
+    font-size: 24px;
+}}
+
+.header p {{
+    margin: 6px 0 0;
+    color: #687386;
+}}
+
+.container {{
+    max-width: 1100px;
+    margin: 24px auto 60px;
+    padding: 0 18px;
+}}
+
+.status {{
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+}}
+
+.badge {{
+    background: white;
+    border: 1px solid #dfe4ea;
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-weight: 600;
+}}
+
+.grid {{
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit, minmax(320px, 1fr));
+    gap: 18px;
+}}
+
+.card {{
+    background: #ffffff;
+    border: 1px solid #dfe4ea;
+    border-radius: 14px;
+    padding: 20px;
+}}
+
+.card h2 {{
+    margin: 0 0 4px;
+    font-size: 18px;
+}}
+
+.card .description {{
+    color: #687386;
+    font-size: 13px;
+    margin-bottom: 18px;
+}}
+
+.row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 10px 0;
+    border-bottom: 1px solid #edf0f3;
+}}
+
+.row:last-child {{
+    border-bottom: none;
+}}
+
+.row label {{
+    font-size: 14px;
+}}
+
+input[type="number"],
+input[type="password"] {{
+    width: 135px;
+    padding: 9px 10px;
+    border: 1px solid #cfd6df;
+    border-radius: 8px;
+    font-size: 14px;
+}}
+
+.switch {{
+    position: relative;
+    width: 46px;
+    height: 26px;
+}}
+
+.switch input {{
+    display: none;
+}}
+
+.slider {{
+    position: absolute;
+    inset: 0;
+    background: #b8c0cc;
+    border-radius: 20px;
+    cursor: pointer;
+    transition: .2s;
+}}
+
+.slider:before {{
+    content: "";
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    left: 3px;
+    top: 3px;
+    background: white;
+    border-radius: 50%;
+    transition: .2s;
+}}
+
+.switch input:checked + .slider {{
+    background: #1473e6;
+}}
+
+.switch input:checked + .slider:before {{
+    transform: translateX(20px);
+}}
+
+.kill {{
+    border: 2px solid #f0b6b6;
+}}
+
+.actions {{
+    margin-top: 22px;
+    background: white;
+    border: 1px solid #dfe4ea;
+    border-radius: 14px;
+    padding: 20px;
+}}
+
+.password {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}}
+
+.password input {{
+    width: 260px;
+}}
+
+button {{
+    border: none;
+    border-radius: 9px;
+    padding: 11px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+}}
+
+.save {{
+    background: #1473e6;
+    color: white;
+}}
+
+.reload {{
+    background: #e9edf2;
+    color: #172033;
+}}
+
+.message {{
+    margin-top: 14px;
+    font-weight: 600;
+}}
+
+.success {{
+    color: #087a35;
+}}
+
+.error {{
+    color: #b42318;
+}}
+
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+}}
+
+th, td {{
+    text-align: left;
+    padding: 9px;
+    border-bottom: 1px solid #edf0f3;
+    font-size: 13px;
+}}
+
+th {{
+    color: #687386;
+}}
+
+small {{
+    color: #687386;
+}}
+
+a {{
+    color: #1473e6;
+    text-decoration: none;
+}}
+</style>
+</head>
+
+<body>
+
+<div class="header">
+    <h1>JNE POD SDK Configuration</h1>
+    <p>
+        Remote validation policy management.
+        Changes apply to SDK sessions without rebuilding the APK.
+    </p>
+</div>
+
+<div class="container">
+
+    <div class="status">
+        <div class="badge">
+            Active Version:
+            <span id="version"></span>
+        </div>
+
+        <div class="badge">
+            SDK:
+            <span id="sdkStatus"></span>
+        </div>
+
+        <div class="badge">
+            <a href="/sdk-config" target="_blank">
+                View Raw SDK Config
+            </a>
+        </div>
+    </div>
+
+    <div class="grid">
+
+        <div class="card kill">
+            <h2>SDK Kill Switch</h2>
+            <div class="description">
+                Disable new POD validation sessions remotely.
+                Existing queued sync is not deleted.
+            </div>
+
+            <div class="row">
+                <label>SDK Enabled</label>
+                <label class="switch">
+                    <input
+                        id="sdkEnabled"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Refresh Interval (seconds)</label>
+                <input
+                    id="refreshIntervalSeconds"
+                    type="number"
+                    min="30"
+                    max="86400">
+            </div>
+        </div>
+
+
+        <div class="card">
+            <h2>Package Validation</h2>
+            <div class="description">
+                Configure mandatory parcel evidence.
+            </div>
+
+            <div class="row">
+                <label>Package Required</label>
+                <label class="switch">
+                    <input
+                        id="packageRequired"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Minimum Confidence</label>
+                <input
+                    id="packageConfidence"
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    max="1">
+            </div>
+        </div>
+
+
+        <div class="card">
+            <h2>Person Validation</h2>
+            <div class="description">
+                Person is optional by default.
+            </div>
+
+            <div class="row">
+                <label>Person Required</label>
+                <label class="switch">
+                    <input
+                        id="personRequired"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Accept Partial Person</label>
+                <label class="switch">
+                    <input
+                        id="acceptPartial"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Accept Uncertain Person</label>
+                <label class="switch">
+                    <input
+                        id="acceptUncertain"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Minimum Confidence</label>
+                <input
+                    id="personConfidence"
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    max="1">
+            </div>
+        </div>
+
+
+        <div class="card">
+            <h2>Photo Quality</h2>
+            <div class="description">
+                Configure minimum evidence quality and retake rules.
+            </div>
+
+            <div class="row">
+                <label>Minimum Width</label>
+                <input id="minWidth" type="number">
+            </div>
+
+            <div class="row">
+                <label>Minimum Height</label>
+                <input id="minHeight" type="number">
+            </div>
+
+            <div class="row">
+                <label>Minimum File Size</label>
+                <input id="minFileSize" type="number">
+            </div>
+
+            <div class="row">
+                <label>Minimum Brightness</label>
+                <input
+                    id="minBrightness"
+                    type="number"
+                    step="0.1">
+            </div>
+
+            <div class="row">
+                <label>Minimum Contrast</label>
+                <input
+                    id="minContrast"
+                    type="number"
+                    step="0.1">
+            </div>
+
+            <div class="row">
+                <label>Minimum Sharpness</label>
+                <input
+                    id="minSharpness"
+                    type="number"
+                    step="0.1">
+            </div>
+
+            <div class="row">
+                <label>Retake on Dark</label>
+                <label class="switch">
+                    <input
+                        id="retakeDark"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Retake on Blur</label>
+                <label class="switch">
+                    <input
+                        id="retakeBlur"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Retake on Low Contrast</label>
+                <label class="switch">
+                    <input
+                        id="retakeContrast"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Retake on Low Resolution</label>
+                <label class="switch">
+                    <input
+                        id="retakeResolution"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+        </div>
+
+
+        <div class="card">
+            <h2>GPS Validation</h2>
+            <div class="description">
+                Configure GPS requirement and allowed delivery radius.
+            </div>
+
+            <div class="row">
+                <label>GPS Required</label>
+                <label class="switch">
+                    <input
+                        id="gpsRequired"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Delivery Radius (meters)</label>
+                <input
+                    id="gpsRadius"
+                    type="number"
+                    step="1">
+            </div>
+
+            <div class="row">
+                <label>Require Destination Point</label>
+                <label class="switch">
+                    <input
+                        id="requireDestination"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+        </div>
+
+
+        <div class="card">
+            <h2>Location Evidence</h2>
+            <div class="description">
+                These controls are reserved for genuine
+                house/gate/building recognition.
+            </div>
+
+            <div class="row">
+                <label>Location Evidence Required</label>
+                <label class="switch">
+                    <input
+                        id="locationRequired"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Accept House</label>
+                <label class="switch">
+                    <input
+                        id="acceptHouse"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Accept Gate</label>
+                <label class="switch">
+                    <input
+                        id="acceptGate"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="row">
+                <label>Accept Building</label>
+                <label class="switch">
+                    <input
+                        id="acceptBuilding"
+                        type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+        </div>
+
+    </div>
+
+
+    <div class="actions">
+        <h2>Save Configuration</h2>
+
+        <p>
+            <small>
+                Each successful save automatically creates a new
+                configuration version and audit record.
+            </small>
+        </p>
+
+        <div class="password">
+            <input
+                id="adminPassword"
+                type="password"
+                placeholder="Admin password">
+
+            <button
+                class="save"
+                onclick="saveConfig()">
+                Save Configuration
+            </button>
+
+            <button
+                class="reload"
+                onclick="location.reload()">
+                Reload
+            </button>
+        </div>
+
+        <div
+            id="message"
+            class="message">
+        </div>
+    </div>
+
+
+    <div class="card" style="margin-top:18px">
+        <h2>Recent Configuration History</h2>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Version</th>
+                    <th>Changed At</th>
+                    <th>Changed By</th>
+                </tr>
+            </thead>
+
+            <tbody>
+                {history_html}
+            </tbody>
+        </table>
+    </div>
+
+</div>
+
+
+<script>
+const initial = {config_json};
+
+function setCheck(id, value) {{
+    document.getElementById(id).checked = !!value;
+}}
+
+function setValue(id, value) {{
+    document.getElementById(id).value = value;
+}}
+
+function loadConfig(c) {{
+    document.getElementById("version").textContent =
+        c.configVersion;
+
+    document.getElementById("sdkStatus").textContent =
+        c.sdkEnabled ? "ENABLED" : "DISABLED";
+
+    setCheck("sdkEnabled", c.sdkEnabled);
+    setValue(
+        "refreshIntervalSeconds",
+        c.refreshIntervalSeconds
+    );
+
+    setCheck(
+        "packageRequired",
+        c.package.required
+    );
+    setValue(
+        "packageConfidence",
+        c.package.minConfidence
+    );
+
+    setCheck(
+        "personRequired",
+        c.person.required
+    );
+    setCheck(
+        "acceptPartial",
+        c.person.acceptPartial
+    );
+    setCheck(
+        "acceptUncertain",
+        c.person.acceptUncertain
+    );
+    setValue(
+        "personConfidence",
+        c.person.minConfidence
+    );
+
+    setValue(
+        "minWidth",
+        c.photo.minWidth
+    );
+    setValue(
+        "minHeight",
+        c.photo.minHeight
+    );
+    setValue(
+        "minFileSize",
+        c.photo.minFileSizeBytes
+    );
+    setValue(
+        "minBrightness",
+        c.photo.minBrightness
+    );
+    setValue(
+        "minContrast",
+        c.photo.minContrast
+    );
+    setValue(
+        "minSharpness",
+        c.photo.minSharpness
+    );
+
+    setCheck(
+        "retakeDark",
+        c.photo.retakeOnDark
+    );
+    setCheck(
+        "retakeBlur",
+        c.photo.retakeOnBlur
+    );
+    setCheck(
+        "retakeContrast",
+        c.photo.retakeOnLowContrast
+    );
+    setCheck(
+        "retakeResolution",
+        c.photo.retakeOnLowResolution
+    );
+
+    setCheck(
+        "gpsRequired",
+        c.gps.required
+    );
+    setValue(
+        "gpsRadius",
+        c.gps.allowedDeliveryRadiusMeters
+    );
+    setCheck(
+        "requireDestination",
+        c.gps.requireDestinationPoint
+    );
+
+    setCheck(
+        "locationRequired",
+        c.locationEvidence.required
+    );
+    setCheck(
+        "acceptHouse",
+        c.locationEvidence.acceptHouse
+    );
+    setCheck(
+        "acceptGate",
+        c.locationEvidence.acceptGate
+    );
+    setCheck(
+        "acceptBuilding",
+        c.locationEvidence.acceptBuilding
+    );
+}}
+
+function checked(id) {{
+    return document.getElementById(id).checked;
+}}
+
+function num(id) {{
+    return Number(document.getElementById(id).value);
+}}
+
+async function saveConfig() {{
+    const message =
+        document.getElementById("message");
+
+    message.className = "message";
+    message.textContent = "Saving...";
+
+    const config = {{
+        sdkEnabled: checked("sdkEnabled"),
+
+        refreshIntervalSeconds:
+            num("refreshIntervalSeconds"),
+
+        photo: {{
+            minWidth: num("minWidth"),
+            minHeight: num("minHeight"),
+            minFileSizeBytes: num("minFileSize"),
+
+            minBrightness: num("minBrightness"),
+            minContrast: num("minContrast"),
+            minSharpness: num("minSharpness"),
+
+            retakeOnDark:
+                checked("retakeDark"),
+
+            retakeOnBlur:
+                checked("retakeBlur"),
+
+            retakeOnLowResolution:
+                checked("retakeResolution"),
+
+            retakeOnLowContrast:
+                checked("retakeContrast")
+        }},
+
+        person: {{
+            required:
+                checked("personRequired"),
+
+            acceptPartial:
+                checked("acceptPartial"),
+
+            acceptUncertain:
+                checked("acceptUncertain"),
+
+            minConfidence:
+                num("personConfidence")
+        }},
+
+        package: {{
+            required:
+                checked("packageRequired"),
+
+            minConfidence:
+                num("packageConfidence")
+        }},
+
+        gps: {{
+            required:
+                checked("gpsRequired"),
+
+            allowedDeliveryRadiusMeters:
+                num("gpsRadius"),
+
+            requireDestinationPoint:
+                checked("requireDestination")
+        }},
+
+        locationEvidence: {{
+            required:
+                checked("locationRequired"),
+
+            acceptHouse:
+                checked("acceptHouse"),
+
+            acceptGate:
+                checked("acceptGate"),
+
+            acceptBuilding:
+                checked("acceptBuilding")
+        }}
+    }};
+
+    try {{
+        const response = await fetch(
+            "/config/api",
+            {{
+                method: "POST",
+                headers: {{
+                    "Content-Type": "application/json"
+                }},
+                body: JSON.stringify({{
+                    adminPassword:
+                        document.getElementById(
+                            "adminPassword"
+                        ).value,
+
+                    config: config
+                }})
+            }}
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {{
+            throw new Error(
+                result.detail ||
+                "Configuration save failed"
+            );
+        }}
+
+        message.className =
+            "message success";
+
+        message.textContent =
+            "Saved successfully. Active version: " +
+            result.configVersion;
+
+        setTimeout(
+            () => location.reload(),
+            900
+        );
+
+    }} catch (error) {{
+        message.className =
+            "message error";
+
+        message.textContent =
+            error.message;
+    }}
+}}
+
+loadConfig(initial);
+</script>
+
+</body>
+</html>
+""")
+
+
+@app.post("/config/api")
+async def save_sdk_config(request: Request):
+
+    configured_password = os.getenv(
+        "JNE_CONFIG_PASSWORD",
+        "",
+    )
+
+    if not configured_password:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configuration admin password "
+                "is not configured on the server."
+            ),
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON request",
+        )
+
+    password = str(
+        payload.get("adminPassword") or ""
+    )
+
+    if password != configured_password:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin password",
+        )
+
+    incoming = payload.get("config")
+
+    if not isinstance(incoming, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Missing configuration",
+        )
+
+    with SessionLocal() as db:
+        row = _get_sdk_config_row(db)
+
+        next_revision = row.revision + 1
+        next_version = f"1.{next_revision}"
+
+        try:
+            normalized = _normalize_sdk_config(
+                incoming,
+                next_version,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400,
+                detail=str(error),
+            )
+
+        now = datetime.now(timezone.utc)
+
+        row.revision = next_revision
+        row.configVersion = next_version
+        row.configJson = normalized
+        row.updatedAt = now
+
+        db.add(
+            SdkConfigAudit(
+                configVersion=next_version,
+                changedAt=now,
+                changedBy="JNE_ADMIN",
+                configJson=normalized,
+            )
+        )
+
+        db.commit()
+
+        return {
+            "status": "saved",
+            "configVersion": next_version,
+            "sdkEnabled": normalized["sdkEnabled"],
+        }
