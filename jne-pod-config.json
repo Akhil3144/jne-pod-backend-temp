@@ -1,37 +1,34 @@
 {
   "sdkEnabled": true,
-  "configVersion": "1.0",
-  "refreshIntervalSeconds": 600,
-
+  "configVersion": "1.1",
+  "refreshIntervalSeconds": 30,
   "photo": {
     "minWidth": 640,
     "minHeight": 480,
     "minFileSizeBytes": 10000,
     "minBrightness": 45.0,
-    "minContrast": 18.0,
-    "minSharpness": 12.0,
+    "minContrast": 10.0,
+    "minSharpness": 25.0,
     "retakeOnDark": true,
     "retakeOnBlur": true,
     "retakeOnLowResolution": true,
     "retakeOnLowContrast": true
   },
-
   "person": {
     "required": false,
     "acceptPartial": true,
-    "acceptUncertain": true
+    "acceptUncertain": true,
+    "minConfidence": 0.7
   },
-
   "package": {
-    "required": true
+    "required": true,
+    "minConfidence": 0.2
   },
-
   "gps": {
     "required": true,
     "allowedDeliveryRadiusMeters": 250.0,
     "requireDestinationPoint": false
   },
-
   "locationEvidence": {
     "required": false,
     "acceptHouse": true,

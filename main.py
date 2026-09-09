@@ -318,3 +318,11 @@ function showDetail(id){let r=all.find(x=>x.eventId===id),fields=['eventId','ide
 async function load(){let y=scrollY;try{let res=await fetch('/api/pod',{cache:'no-store'});if(!res.ok)throw Error();all=await res.json();let users=[...new Set(all.map(x=>x.username).filter(Boolean))].sort(),statuses=[...new Set(all.map(label).filter(Boolean))].sort(),oldU=val('username'),oldS=val('status');$('username').innerHTML='<option value="">All usernames</option>'+users.map(x=>`<option>${esc(x)}</option>`).join('');$('status').innerHTML='<option value="">All actions/statuses</option>'+statuses.map(x=>`<option>${esc(x)}</option>`).join('');$('username').value=oldU;$('status').value=oldS;render();requestAnimationFrame(()=>scrollTo(0,y))}catch(e){console.warn('Dashboard refresh failed')}}
 ['username','from','to','waybill','status'].forEach(id=>$(id).addEventListener(id==='waybill'?'input':'change',render));$('tableToggle').onclick=()=>{tableOpen=!tableOpen;localStorage.setItem('jneTableOpen',tableOpen);render()};load();setInterval(load,10000);
 </script></body></html>'''
+
+
+@app.get("/sdk-config")
+def sdk_config():
+    import json
+    from pathlib import Path
+    config_path = Path(__file__).with_name("jne-pod-config.json")
+    return json.loads(config_path.read_text())
