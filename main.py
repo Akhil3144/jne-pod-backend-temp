@@ -511,14 +511,17 @@ def _integer(
     return value
 
 
-def _outcome_policy(value):
+def _outcome_policy(value, default_blur="INHERIT"):
     if not isinstance(value, dict):
         raise ValueError("Invalid outcome policy")
     alternatives = value.get("acceptedAlternatives", [])
     allowed = {"PACKAGE", "PACKAGE_AND_PERSON", "LOCATION", "PACKAGE_AND_LOCATION"}
     if not isinstance(alternatives, list) or any(not isinstance(x, str) or x not in allowed for x in alternatives):
         raise ValueError("Invalid evidence alternatives")
-    return {"acceptedAlternatives": alternatives}
+    blur = value.get("blurHandling", default_blur)
+    if blur not in ("INHERIT", "RETAKE", "ALLOW", "ALLOW_WITH_PARTIAL_PERSON"):
+        raise ValueError("Invalid blur handling")
+    return {"acceptedAlternatives": alternatives, "blurHandling": blur}
 
 
 def _normalize_sdk_config(
@@ -548,7 +551,7 @@ def _normalize_sdk_config(
     )
 
     return {
-        "delivered": _outcome_policy(incoming.get("delivered", {})),
+        "delivered": _outcome_policy(incoming.get("delivered", {}), "ALLOW_WITH_PARTIAL_PERSON"),
         "failedDelivery": _outcome_policy(incoming.get("failedDelivery", {})),
         "sdkEnabled": _bool(
             incoming,
@@ -633,6 +636,7 @@ def _normalize_sdk_config(
         },
 
         "package": {
+            "awbRequired": _bool(package, "awbRequired", True),
             "required": _bool(
                 package, "required", True
             ),
@@ -682,6 +686,18 @@ def _normalize_sdk_config(
     }
 
 
+def _effective_sdk_config(row: SdkConfiguration) -> dict[str, Any]:
+    # Additive read-time defaults support persisted 1.3 rows without deleting data,
+    # changing an existing policy value, or creating an unaudited revision.
+    config = json.loads(json.dumps(row.configJson))
+    config.setdefault("package", {}).setdefault("awbRequired", True)
+    for name, blur in (("delivered", "ALLOW_WITH_PARTIAL_PERSON"), ("failedDelivery", "INHERIT")):
+        outcome = config.setdefault(name, {})
+        outcome.setdefault("acceptedAlternatives", [])
+        outcome.setdefault("blurHandling", blur)
+    return config
+
+
 @app.get("/sdk-config")
 def sdk_config():
     """
@@ -690,7 +706,7 @@ def sdk_config():
     """
     with SessionLocal() as db:
         row = _get_sdk_config_row(db)
-        return JSONResponse(content=row.configJson)
+        return JSONResponse(content=_effective_sdk_config(row))
 
 
 @app.get("/config", response_class=HTMLResponse)
@@ -704,7 +720,7 @@ def sdk_config_admin_page():
             .limit(10)
         ).scalars().all()
 
-        config_json = json.dumps({k: v for k, v in row.configJson.items() if k != "sdkEnabled"})
+        config_json = json.dumps({k: v for k, v in _effective_sdk_config(row).items() if k != "sdkEnabled"})
 
         history_html = "".join(
             f"""
@@ -974,9 +990,16 @@ a {{
     </div>
 
     <div class="card"><h2>Delivery evidence alternatives</h2>
-    <p>Comma separated: PACKAGE, PACKAGE_AND_PERSON, LOCATION, PACKAGE_AND_LOCATION. Empty uses required evidence settings. Required person/location settings still apply.</p>
+    <p>Comma separated: PACKAGE, PACKAGE_AND_PERSON, LOCATION, PACKAGE_AND_LOCATION. Empty uses global required evidence settings. Non-empty alternatives are OR paths and define their own evidence requirements. Package paths include AWB when required.</p>
     <label>DELIVERED <input id="deliveredAlternatives"></label>
-    <label>FAILED_DELIVERY <input id="failedAlternatives"></label></div>
+    <label>FAILED_DELIVERY <input id="failedAlternatives"></label>
+    <p>Blur handling: INHERIT uses the photo blur toggle; RETAKE always requests a retake; ALLOW ignores blur only; ALLOW_WITH_PARTIAL_PERSON permits blur only with accepted partial-person and accepted package evidence.</p>
+    <label>DELIVERED blur <select id="deliveredBlur">
+        <option>INHERIT</option><option>RETAKE</option><option>ALLOW</option><option>ALLOW_WITH_PARTIAL_PERSON</option>
+    </select></label>
+    <label>FAILED_DELIVERY blur <select id="failedBlur">
+        <option>INHERIT</option><option>RETAKE</option><option>ALLOW</option><option>ALLOW_WITH_PARTIAL_PERSON</option>
+    </select></label></div>
     <div class="grid">
 
         <div class="card">
@@ -995,7 +1018,11 @@ a {{
         <div class="card">
             <h2>Package Validation</h2>
             <div class="description">
-                Configure mandatory parcel evidence.
+                Configure mandatory parcel evidence. AWB/Resi requires readable courier identifiers together with parcel evidence.
+            </div>
+            <div class="row">
+                <label>AWB/Resi Required</label>
+                <label class="switch"><input id="awbRequired" type="checkbox"><span class="slider"></span></label>
             </div>
 
             <div class="row">
@@ -1311,6 +1338,9 @@ function setValue(id, value) {{
 }}
 
 function loadConfig(c) {{
+    setCheck("awbRequired", c.package.awbRequired ?? true);
+    setValue("deliveredBlur", c.delivered?.blurHandling ?? "ALLOW_WITH_PARTIAL_PERSON");
+    setValue("failedBlur", c.failedDelivery?.blurHandling ?? "INHERIT");
     setValue("deliveredAlternatives", (c.delivered?.acceptedAlternatives || []).join(","));
     setValue("failedAlternatives", (c.failedDelivery?.acceptedAlternatives || []).join(","));
     document.getElementById("version").textContent =
@@ -1436,8 +1466,8 @@ async function saveConfig() {{
     message.textContent = "Saving...";
 
     const config = {{
-        delivered: {{acceptedAlternatives: document.getElementById("deliveredAlternatives").value.split(",").map(x => x.trim()).filter(Boolean)}},
-        failedDelivery: {{acceptedAlternatives: document.getElementById("failedAlternatives").value.split(",").map(x => x.trim()).filter(Boolean)}},
+        delivered: {{blurHandling: document.getElementById("deliveredBlur").value, acceptedAlternatives: document.getElementById("deliveredAlternatives").value.split(",").map(x => x.trim()).filter(Boolean)}},
+        failedDelivery: {{blurHandling: document.getElementById("failedBlur").value, acceptedAlternatives: document.getElementById("failedAlternatives").value.split(",").map(x => x.trim()).filter(Boolean)}},
 
         refreshIntervalSeconds:
             num("refreshIntervalSeconds"),
@@ -1479,6 +1509,7 @@ async function saveConfig() {{
         }},
 
         package: {{
+            awbRequired: checked("awbRequired"),
             required:
                 checked("packageRequired"),
 
