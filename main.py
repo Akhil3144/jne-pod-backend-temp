@@ -511,6 +511,16 @@ def _integer(
     return value
 
 
+def _outcome_policy(value):
+    if not isinstance(value, dict):
+        raise ValueError("Invalid outcome policy")
+    alternatives = value.get("acceptedAlternatives", [])
+    allowed = {"PACKAGE", "PACKAGE_AND_PERSON", "LOCATION", "PACKAGE_AND_LOCATION"}
+    if not isinstance(alternatives, list) or any(not isinstance(x, str) or x not in allowed for x in alternatives):
+        raise ValueError("Invalid evidence alternatives")
+    return {"acceptedAlternatives": alternatives}
+
+
 def _normalize_sdk_config(
     incoming: dict[str, Any],
     version: str,
@@ -538,6 +548,8 @@ def _normalize_sdk_config(
     )
 
     return {
+        "delivered": _outcome_policy(incoming.get("delivered", {})),
+        "failedDelivery": _outcome_policy(incoming.get("failedDelivery", {})),
         "sdkEnabled": _bool(
             incoming,
             "sdkEnabled",
@@ -692,7 +704,7 @@ def sdk_config_admin_page():
             .limit(10)
         ).scalars().all()
 
-        config_json = json.dumps(row.configJson)
+        config_json = json.dumps({k: v for k, v in row.configJson.items() if k != "sdkEnabled"})
 
         history_html = "".join(
             f"""
@@ -958,37 +970,17 @@ a {{
             <span id="version"></span>
         </div>
 
-        <div class="badge">
-            SDK:
-            <span id="sdkStatus"></span>
-        </div>
 
-        <div class="badge">
-            <a href="/sdk-config" target="_blank">
-                View Raw SDK Config
-            </a>
-        </div>
     </div>
 
+    <div class="card"><h2>Delivery evidence alternatives</h2>
+    <p>Comma separated: PACKAGE, PACKAGE_AND_PERSON, LOCATION, PACKAGE_AND_LOCATION. Empty uses required evidence settings. Required person/location settings still apply.</p>
+    <label>DELIVERED <input id="deliveredAlternatives"></label>
+    <label>FAILED_DELIVERY <input id="failedAlternatives"></label></div>
     <div class="grid">
 
-        <div class="card kill">
-            <h2>SDK Kill Switch</h2>
-            <div class="description">
-                Disable new POD validation sessions remotely.
-                Existing queued sync is not deleted.
-            </div>
-
-            <div class="row">
-                <label>SDK Enabled</label>
-                <label class="switch">
-                    <input
-                        id="sdkEnabled"
-                        type="checkbox">
-                    <span class="slider"></span>
-                </label>
-            </div>
-
+        <div class="card">
+            <h2>Session Configuration</h2>
             <div class="row">
                 <label>Refresh Interval (seconds)</label>
                 <input
@@ -1319,13 +1311,11 @@ function setValue(id, value) {{
 }}
 
 function loadConfig(c) {{
+    setValue("deliveredAlternatives", (c.delivered?.acceptedAlternatives || []).join(","));
+    setValue("failedAlternatives", (c.failedDelivery?.acceptedAlternatives || []).join(","));
     document.getElementById("version").textContent =
         c.configVersion;
 
-    document.getElementById("sdkStatus").textContent =
-        c.sdkEnabled ? "ENABLED" : "DISABLED";
-
-    setCheck("sdkEnabled", c.sdkEnabled);
     setValue(
         "refreshIntervalSeconds",
         c.refreshIntervalSeconds
@@ -1446,7 +1436,8 @@ async function saveConfig() {{
     message.textContent = "Saving...";
 
     const config = {{
-        sdkEnabled: checked("sdkEnabled"),
+        delivered: {{acceptedAlternatives: document.getElementById("deliveredAlternatives").value.split(",").map(x => x.trim()).filter(Boolean)}},
+        failedDelivery: {{acceptedAlternatives: document.getElementById("failedAlternatives").value.split(",").map(x => x.trim()).filter(Boolean)}},
 
         refreshIntervalSeconds:
             num("refreshIntervalSeconds"),
@@ -1578,6 +1569,7 @@ loadConfig(initial);
 """)
 
 
+@app.post("/kill-switch/api")
 @app.post("/config/api")
 async def save_sdk_config(request: Request):
 
@@ -1624,6 +1616,13 @@ async def save_sdk_config(request: Request):
     with SessionLocal() as db:
         row = _get_sdk_config_row(db)
 
+        if request.url.path == "/kill-switch/api":
+            if set(incoming) != {"sdkEnabled"} or not isinstance(incoming["sdkEnabled"], bool):
+                raise HTTPException(status_code=400, detail="Only SDK enabled control is accepted")
+            incoming = {**row.configJson, "sdkEnabled": incoming["sdkEnabled"]}
+        else:
+            incoming = {**incoming, "sdkEnabled": row.configJson.get("sdkEnabled", True)}
+
         next_revision = row.revision + 1
         next_version = f"1.{next_revision}"
 
@@ -1659,5 +1658,25 @@ async def save_sdk_config(request: Request):
         return {
             "status": "saved",
             "configVersion": next_version,
-            "sdkEnabled": normalized["sdkEnabled"],
+
         }
+
+
+@app.get("/kill-switch", response_class=HTMLResponse)
+def kill_switch_page():
+    with SessionLocal() as db:
+        enabled = _get_sdk_config_row(db).configJson.get("sdkEnabled", True)
+    checked = "checked" if enabled else ""
+    return HTMLResponse("""<!doctype html><html><head><title>SDK control</title></head><body>
+    <h1>SDK enabled / disabled</h1><form id="control">
+    <label>SDK enabled <input id="enabled" type="checkbox" CHECKED></label>
+    <label>Admin password <input id="password" type="password" required></label>
+    <button>Save</button></form><p id="message"></p><script>
+    document.getElementById('control').onsubmit = async (event) => {
+      event.preventDefault();
+      try {
+        const response = await fetch('/kill-switch/api', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({adminPassword:document.getElementById('password').value,config:{sdkEnabled:document.getElementById('enabled').checked}})});
+        const data = await response.json();
+        document.getElementById('message').textContent = response.ok ? 'Saved' : data.detail;
+      } catch (_) { document.getElementById('message').textContent = 'Save failed'; }
+    };</script></body></html>""".replace("CHECKED", checked))
