@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, Integer, String, Text, create_engine, or_, select
+from scan_gps import DEFAULT_POLICY, validate_scan, validate_point, evaluate as evaluate_scan_gps
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -82,6 +83,95 @@ class PodEvent(Base):
     derivedDeliveryStatus: Mapped[str | None] = mapped_column(String(100), nullable=True)
     photoMapsLink: Mapped[str | None] = mapped_column(Text, nullable=True)
     extraFields: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+class ScanAttempt(Base):
+    __tablename__ = "pod_scan_attempts"
+    scanAttemptId: Mapped[str] = mapped_column(String(255), primary_key=True)
+    waybill: Mapped[str] = mapped_column(String(255), index=True)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class ScanPhotoEvidence(Base):
+    __tablename__ = "pod_scan_photo_evidence"
+    imageHash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    eventId: Mapped[str] = mapped_column(String(255), unique=True)
+    scanAttemptId: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+def scan_mode(data):
+    return data.get("gpsValidationMode") == "SCAN_TO_PHOTO"
+
+
+def apply_scan_mode(data, db):
+    scan, photo = data.get("scan"), data.get("photoLocation")
+    at = data.get("photoTimestampEpoch")
+    try:
+        if not isinstance(at, int) or isinstance(at, bool) or at <= 0:
+            raise ValueError("Photo timestamp required")
+        if at > int(datetime.now(timezone.utc).timestamp() * 1000) + 30000:
+            raise ValueError("Photo timestamp is in the future")
+        validate_point(photo)
+        if scan is not None:
+            validate_scan(scan, data["waybill"])
+            if data.get("scanAttemptId") != scan["scanAttemptId"]:
+                raise ValueError("Scan attempt association mismatch")
+            if scan["scannedAtEpochMillis"] >= at:
+                raise ValueError("New photo required after scan")
+        elif data.get("scanAttemptId") is not None:
+            raise ValueError("Scan evidence required for scanAttemptId")
+        history = data.get("scanHistory", [])
+        if not isinstance(history, list) or len(history) > 10000:
+            raise ValueError("Invalid scan history")
+        image_hash = data.get("imageHash")
+        if not isinstance(image_hash, str) or len(image_hash) != 64 or any(c not in "0123456789abcdef" for c in image_hash):
+            raise ValueError("SHA-256 imageHash required")
+        if data.get("photoAiStatus") not in ("VALID", "INVALID", "RETAKE_REQUIRED", "NEEDS_REVIEW"):
+            raise ValueError("photoAiStatus required")
+        attempts = {}
+        for entry in history + ([scan] if scan else []):
+            validate_scan(entry, data["waybill"])
+            if entry["scannedAtEpochMillis"] >= at:
+                raise ValueError("Scan history must precede photo")
+            key = entry["scanAttemptId"]
+            if key in attempts and attempts[key] != entry:
+                raise ValueError("Conflicting scan history")
+            attempts[key] = entry
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from None
+    for key, entry in attempts.items():
+        old = db.get(ScanAttempt, key)
+        if old and (old.waybill != data["waybill"] or old.evidence != entry):
+            raise HTTPException(409, detail="Scan attempt is immutable and bound to its AWB")
+        if not old:
+            db.add(ScanAttempt(scanAttemptId=key, waybill=data["waybill"], evidence=entry))
+    if db.get(ScanPhotoEvidence, image_hash):
+        raise HTTPException(409, detail="Photo already used; take a new photo after rescanning")
+    db.add(ScanPhotoEvidence(imageHash=image_hash, eventId=data["eventId"], scanAttemptId=data.get("scanAttemptId")))
+    # Use server configuration, never a client-provided threshold. Audited version supports delayed offline sync.
+    config = _effective_sdk_config(_get_sdk_config_row(db))
+    version = data.get("configVersion")
+    if version:
+        audited = db.scalar(select(SdkConfigAudit).where(SdkConfigAudit.configVersion == version))
+        if audited:
+            config = audited.configJson
+    gps = config.get("gps", {})
+    policy = {key: gps.get(key, default) for key, default in DEFAULT_POLICY.items()}
+    status, reason, distance = evaluate_scan_gps(scan, photo, at, policy)
+    a = scan.get("location") if scan else None
+    data.update(actionLatitude=a["latitude"] if a else None, actionLongitude=a["longitude"] if a else None,
+                photoLatitude=photo["latitude"] if photo else None, photoLongitude=photo["longitude"] if photo else None,
+                actionTimestampEpoch=scan["scannedAtEpochMillis"] if scan else None)
+    ai = data["photoAiStatus"]
+    overall = ai if ai != "VALID" else ("VALID" if status == "GPS_PASS" else "INVALID" if status == "GPS_FAIL_OUTSIDE_SCAN_RADIUS" else "NEEDS_REVIEW")
+    data.update(gpsValidationMode="SCAN_TO_PHOTO", validationMode="SCAN_TO_PHOTO",
+                gpsStatus=status, gpsValidationResult=status, gpsValidationReason=reason,
+                scanToPhotoDistanceMeters=distance, actionToPhotoDistanceMeters=distance,
+                actionToBackendDistanceMeters=None, photoToBackendDistanceMeters=None,
+                thresholdMeters=policy["allowedDeliveryRadiusMeters"], gpsPolicy=policy,
+                validationStatus=overall, overallPodStatus=overall, complianceFlag="COMPLIANT" if overall == "VALID" else "NON_COMPLIANT",
+                geoMatchComment=reason, derivedDeliveryStatus="DELIVERED" if overall == "VALID" else "REVIEW")
+    return data
 
 
 KNOWN_FIELDS = {c.name for c in PodEvent.__table__.columns} - {"id", "extraFields"}
@@ -201,7 +291,25 @@ def serialize(row: PodEvent) -> dict[str, Any]:
     result = {name: getattr(row, name) for name in KNOWN_FIELDS}
     result["ingestedAt"] = row.ingestedAt.isoformat().replace("+00:00", "Z") if row.ingestedAt else None
     result["extraFields"] = row.extraFields or {}
+    if scan_mode(result["extraFields"]):
+        result.update(result["extraFields"])
     return result
+
+
+def serialize_events(rows):
+    records = [serialize(row) for row in rows]
+    current = {}
+    for record in records:
+        if scan_mode(record):
+            rank = (record.get("overallPodStatus") == "VALID", record["photoTimestampEpoch"], record["eventId"])
+            if record["waybill"] not in current or rank > current[record["waybill"]][0]:
+                current[record["waybill"]] = (rank, record)
+    for record in records:
+        if scan_mode(record):
+            latest = current[record["waybill"]][1]
+            record["currentPodEventId"] = latest["eventId"]
+            record["isCurrentPodAttempt"] = latest["eventId"] == record["eventId"]
+    return records
 
 
 @asynccontextmanager
@@ -232,6 +340,10 @@ def create_pod(payload: dict[str, Any], db: Session = Depends(get_db)) -> dict[s
     for alias, canonical in ALIASES.items():
         if canonical not in normalized and alias in normalized:
             normalized[canonical] = normalized[alias]
+    if normalized.get("validationMode") == "SCAN_TO_PHOTO":
+        if normalized.get("gpsValidationMode") not in (None, "SCAN_TO_PHOTO"):
+            raise HTTPException(422, detail="Conflicting GPS validation modes")
+        normalized["gpsValidationMode"] = "SCAN_TO_PHOTO"
     try:
         data = PodPayload.model_validate(normalized).model_dump()
     except ValidationError as exc:
@@ -239,54 +351,75 @@ def create_pod(payload: dict[str, Any], db: Session = Depends(get_db)) -> dict[s
         raise HTTPException(status_code=422, detail=errors) from None
     existing = db.scalar(select(PodEvent).where(or_(PodEvent.eventId == data["eventId"], PodEvent.idempotencyKey == data["idempotencyKey"])))
     if existing:
+        if scan_mode(data) or scan_mode(existing.extraFields or {}):
+            original = (existing.extraFields or {}).get("submissionEvidence")
+            if existing.eventId != data["eventId"] or existing.idempotencyKey != data["idempotencyKey"] or existing.waybill != data["waybill"] or original != normalized:
+                raise HTTPException(409, detail="Conflicting idempotency replay")
         return {"success": True, "eventId": data["eventId"], "syncStatus": "SYNCED", "duplicate": True}
 
-    data["username"] = data.get("username") if data.get("username") is not None else data.get("courierName")
-    data["complianceFlag"] = compliance(data.get("complianceFlag"))
-    geo_comment = (data.get("geoMatchComment") or "").lower()
-    if "outside" in geo_comment or "out of radius" in geo_comment:
-        data["complianceFlag"] = "NON_COMPLIANT"
-    data["ingestedAt"] = datetime.now(timezone.utc)
-    data["actionToPhotoDistanceMeters"] = data.get("actionToPhotoDistanceMeters")
-    if data["actionToPhotoDistanceMeters"] is None:
-        data["actionToPhotoDistanceMeters"] = haversine(data.get("actionLatitude"), data.get("actionLongitude"), data.get("photoLatitude"), data.get("photoLongitude"))
-    dest_lat, dest_lon = destination(data)
-    if dest_lat is not None:
-        if data.get("actionToBackendDistanceMeters") is None:
-            data["actionToBackendDistanceMeters"] = haversine(data.get("actionLatitude"), data.get("actionLongitude"), dest_lat, dest_lon)
-        if data.get("photoToBackendDistanceMeters") is None:
-            data["photoToBackendDistanceMeters"] = haversine(data.get("photoLatitude"), data.get("photoLongitude"), dest_lat, dest_lon)
-        distance = data.get("photoToBackendDistanceMeters") or data.get("actionToBackendDistanceMeters")
-        if distance is not None and data.get("thresholdMeters") is not None:
-            inside = distance <= data["thresholdMeters"]
-            data["complianceFlag"] = "COMPLIANT" if inside else "NON_COMPLIANT"
-            data["geoMatchComment"] = "Within delivery radius" if inside else "Outside delivery radius"
+    if data.get("gpsValidationMode") not in (None, "LEGACY_DESTINATION", "SCAN_TO_PHOTO"):
+        raise HTTPException(422, detail="Unsupported gpsValidationMode")
+    if scan_mode(data):
+        # Seed config before adding evidence: existing config helper commits its initial seed.
+        _get_sdk_config_row(db)
+        with db.no_autoflush:
+            data = apply_scan_mode(data, db)
+        data["username"] = data.get("username") if data.get("username") is not None else data.get("courierName")
+        data["ingestedAt"] = datetime.now(timezone.utc)
     else:
-        data["actionToBackendDistanceMeters"] = None
-        data["photoToBackendDistanceMeters"] = None
-        if not data.get("validationMode"):
-            data["validationMode"] = "TWO_POINT"
+        data["username"] = data.get("username") if data.get("username") is not None else data.get("courierName")
+        data["complianceFlag"] = compliance(data.get("complianceFlag"))
+        geo_comment = (data.get("geoMatchComment") or "").lower()
+        if "outside" in geo_comment or "out of radius" in geo_comment:
+            data["complianceFlag"] = "NON_COMPLIANT"
+        data["ingestedAt"] = datetime.now(timezone.utc)
+        data["actionToPhotoDistanceMeters"] = data.get("actionToPhotoDistanceMeters")
+        if data["actionToPhotoDistanceMeters"] is None:
+            data["actionToPhotoDistanceMeters"] = haversine(data.get("actionLatitude"), data.get("actionLongitude"), data.get("photoLatitude"), data.get("photoLongitude"))
+        dest_lat, dest_lon = destination(data)
+        if dest_lat is not None:
+            if data.get("actionToBackendDistanceMeters") is None:
+                data["actionToBackendDistanceMeters"] = haversine(data.get("actionLatitude"), data.get("actionLongitude"), dest_lat, dest_lon)
+            if data.get("photoToBackendDistanceMeters") is None:
+                data["photoToBackendDistanceMeters"] = haversine(data.get("photoLatitude"), data.get("photoLongitude"), dest_lat, dest_lon)
+            distance = data.get("photoToBackendDistanceMeters") or data.get("actionToBackendDistanceMeters")
+            if distance is not None and data.get("thresholdMeters") is not None:
+                inside = distance <= data["thresholdMeters"]
+                data["complianceFlag"] = "COMPLIANT" if inside else "NON_COMPLIANT"
+                data["geoMatchComment"] = "Within delivery radius" if inside else "Outside delivery radius"
+        else:
+            data["actionToBackendDistanceMeters"] = None
+            data["photoToBackendDistanceMeters"] = None
+            if not data.get("validationMode"):
+                data["validationMode"] = "TWO_POINT"
 
     extra = {k: v for k, v in payload.items() if k not in KNOWN_FIELDS and k not in ALIASES}
+    if scan_mode(data):
+        extra.update({k: v for k, v in data.items() if k not in KNOWN_FIELDS})
+        extra["submissionEvidence"] = normalized
     row = PodEvent(**{k: v for k, v in data.items() if k in KNOWN_FIELDS}, extraFields=extra or None)
     db.add(row)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        if scan_mode(data):
+            concurrent = db.scalar(select(PodEvent).where(PodEvent.eventId == data["eventId"]))
+            if not concurrent or (concurrent.extraFields or {}).get("submissionEvidence") != normalized:
+                raise HTTPException(409, detail="Conflicting concurrent scan/photo submission")
         return {"success": True, "eventId": data["eventId"], "syncStatus": "SYNCED", "duplicate": True}
     return {"success": True, "eventId": data["eventId"], "syncStatus": "SYNCED", "duplicate": False}
 
 
 @app.get("/api/pod")
 def list_pod(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    return [serialize(row) for row in db.scalars(select(PodEvent).order_by(PodEvent.ingestedAt.desc(), PodEvent.id.desc())).all()]
+    return serialize_events(db.scalars(select(PodEvent).order_by(PodEvent.ingestedAt.desc(), PodEvent.id.desc())).all())
 
 
 @app.get("/api/pod/{waybill}")
 def by_waybill(waybill: str, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     rows = db.scalars(select(PodEvent).where(PodEvent.waybill == waybill).order_by(PodEvent.ingestedAt.desc(), PodEvent.id.desc())).all()
-    return [serialize(row) for row in rows]
+    return serialize_events(rows)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -302,7 +435,7 @@ DASHBOARD_HTML = r'''<!doctype html>
 </style></head><body><header><h1>JNE POD Dashboard</h1><p>Proof of Delivery · Transaction monitoring and compliance</p></header><main class="wrap">
 <section class="panel filters"><div><label>Username</label><select id="username"><option value="">All usernames</option></select></div><div><label>From Date</label><input type="date" id="from"></div><div><label>To Date</label><input type="date" id="to"></div><div><label>Waybill search</label><input id="waybill" placeholder="Search waybill"></div><div><label>Action / Status</label><select id="status"><option value="">All actions/statuses</option></select></div></section>
 <section class="cards" id="cards"></section><section class="charts" id="charts"></section>
-<section class="panel transactions"><h2>Transactions <span class="muted" id="recordCount"></span></h2><div class="tablewrap"><table><thead><tr><th>Ingested UTC</th><th>Username</th><th>Waybill</th><th>Action / Status</th><th>Decision</th><th>Human</th><th>Action → Photo</th><th>Action → Backend</th><th>Photo → Backend</th><th>Threshold</th><th>Validation Mode</th><th>SDK Validation</th><th>SDK GPS</th><th>Photo Quality</th><th>Compliance</th><th>Geo Match</th><th>Map</th><th>Details</th></tr></thead><tbody id="rows"></tbody></table></div><button class="link" id="tableToggle"></button></section>
+<section class="panel transactions"><h2>Transactions <span class="muted" id="recordCount"></span></h2><div class="tablewrap"><table><thead><tr><th>Ingested UTC</th><th>Username</th><th>Waybill</th><th>Action / Status</th><th>Decision</th><th>Human</th><th>Scan → Photo / Legacy Action → Photo</th><th>Legacy Action → Backend</th><th>Legacy Photo → Backend</th><th>Threshold</th><th>Validation Mode</th><th>Overall POD</th><th>GPS status</th><th>Photo AI / Legacy Quality</th><th>Compliance</th><th>Geo Match</th><th>Map</th><th>Scan time / Photo time</th><th>Attempt</th><th>Details</th></tr></thead><tbody id="rows"></tbody></table></div><button class="link" id="tableToggle"></button></section>
 </main><dialog id="details"><div class="modalhead">POD Event Details</div><div class="modalbody" id="detailBody"></div><div class="modalfoot"><button onclick="details.close()">Close</button></div></dialog>
 <script>
 let all=[], chartOpen=JSON.parse(localStorage.getItem('jneChartOpen')||'{}'), tableOpen=localStorage.getItem('jneTableOpen')==='true';
@@ -312,9 +445,18 @@ function filtered(){let f=val('from'),t=val('to'),w=val('waybill').toLowerCase()
 function counts(rows,key){let x={};rows.forEach(r=>{let k=key(r);k=na(k);x[k]=(x[k]||0)+1});return x}function grouped(rows,key){let x={};rows.forEach(r=>{let u=na(r.username),k=na(key(r)),q=u+' · '+k;x[q]=(x[q]||0)+1});return x}
 function chart(title,data,index,limited){let entries=Object.entries(data).sort((a,b)=>b[1]-a[1]),open=chartOpen[index],shown=limited&&!open?entries.slice(0,12):entries,max=Math.max(1,...entries.map(x=>x[1]));return `<article class="panel chart"><h2>${title}</h2>${shown.length?shown.map(([k,n])=>`<div class="barrow"><span title="${esc(k)}">${esc(k)}</span><div class="track"><div class="bar" style="width:${n/max*100}%"></div></div><b>${n}</b></div>`).join(''):'<div class="empty">No matching data</div>'}${limited&&entries.length>12?`<button class="link" onclick="toggleChart('${index}')">${open?'Show less ↑':'Show all ↓'}</button>`:''}</article>`}
 function toggleChart(i){chartOpen[i]=!chartOpen[i];localStorage.setItem('jneChartOpen',JSON.stringify(chartOpen));render()}
-function mapLink(r){let lat=r.photoLatitude??r.actionLatitude,lon=r.photoLongitude??r.actionLongitude;if(lat==null||lon==null)return'N/A';return `<a target="_blank" rel="noopener" href="https://www.google.com/maps?q=${encodeURIComponent(lat+','+lon)}">Open map</a>`}
-function render(){let r=filtered(),summary=[['Total Transactions',r.length],['Delivered',r.filter(x=>label(x)==='DELIVERED').length],['Non-delivered',r.filter(x=>label(x)==='NON_DELIVERED').length],['Genuine',r.filter(x=>String(x.decision).toUpperCase()==='GENUINE').length],['Not Genuine',r.filter(x=>String(x.decision).toUpperCase().replace('_',' ')==='NOT GENUINE').length],['Compliant',r.filter(x=>x.complianceFlag==='COMPLIANT').length],['Non-compliant',r.filter(x=>x.complianceFlag==='NON_COMPLIANT').length]];$('cards').innerHTML=summary.map(x=>`<div class="card"><div class="label">${x[0]}</div><div class="n">${x[1]}</div></div>`).join('');$('charts').innerHTML=chart('Decision by Count',counts(r,x=>x.decision),'a',false)+chart('Count by Username and Decision',grouped(r,x=>x.decision),'b',true)+chart('Count by Username and Human Detection',grouped(r,x=>human(x.humanDetected)),'c',true)+chart('Count by Username and Status',grouped(r,x=>label(x)),'d',true)+chart('Count by Username and Distance Between Clicks',grouped(r,x=>dist(x.actionToPhotoDistanceMeters)),'e',true);$('recordCount').textContent=`(${r.length} filtered records)`;let visible=tableOpen?r:r.slice(0,12);$('rows').innerHTML=visible.map((x,i)=>`<tr><td>${esc(x.ingestedAt)}</td><td>${esc(x.username)}</td><td>${esc(x.waybill)}</td><td>${esc(label(x))}</td><td>${esc(x.decision)}</td><td>${human(x.humanDetected)}</td><td>${dist(x.actionToPhotoDistanceMeters)}</td><td>${dist(x.actionToBackendDistanceMeters)}</td><td>${dist(x.photoToBackendDistanceMeters)}</td><td>${dist(x.thresholdMeters)}</td><td>${esc(x.validationMode)}</td><td>${esc(x.validationStatus)}</td><td>${esc(x.gpsStatus)}</td><td>${quality(x.photoQualityPassed)}</td><td class="${x.complianceFlag==='COMPLIANT'?'good':x.complianceFlag==='NON_COMPLIANT'?'bad':''}">${esc(x.complianceFlag)}</td><td>${esc(x.geoMatchComment)}</td><td>${mapLink(x)}</td><td><button onclick="showDetail('${esc(x.eventId)}')">View Details</button></td></tr>`).join('');$('tableToggle').style.display=r.length>12?'block':'none';$('tableToggle').textContent=tableOpen?'Show latest 12 ↑':'Show all transactions ↓'}
-function showDetail(id){let r=all.find(x=>x.eventId===id),fields=['eventId','idempotencyKey','username','courierName','waybill','actionLatitude','actionLongitude','photoLatitude','photoLongitude','expectedLatitude','expectedLongitude','backendLatitude','backendLongitude','actionTimestampIso','actionTimestampEpoch','photoTimestampIso','photoTimestampEpoch','createdAt','syncedAt','ingestedAt','customerName','address','deviceModel','osVersion','appVersion','summary'];$('detailBody').innerHTML=fields.map(k=>`<div><b>${esc(k)}</b><br><span class="muted">${esc(r[k])}</span></div>`).join('');$('details').showModal()}
+function isScan(r){return r.gpsValidationMode==='SCAN_TO_PHOTO'}
+function locationLink(p,label){return p&&p.latitude!=null&&p.longitude!=null?`<a target="_blank" rel="noopener" href="https://www.google.com/maps?q=${encodeURIComponent(p.latitude+','+p.longitude)}">${label}</a>`:'N/A'}
+function scanTimes(r){return isScan(r)?esc(r.scan?new Date(r.scan.scannedAtEpochMillis).toISOString():null)+' / '+esc(new Date(r.photoTimestampEpoch).toISOString()):'N/A'}
+function mapLink(r){if(isScan(r))return locationLink(r.scan?.location,'Scan GPS (Point A)')+' / '+locationLink(r.photoLocation,'Photo GPS (Point B)');let lat=r.photoLatitude??r.actionLatitude,lon=r.photoLongitude??r.actionLongitude;if(lat==null||lon==null)return'N/A';return `<a target="_blank" rel="noopener" href="https://www.google.com/maps?q=${encodeURIComponent(lat+','+lon)}">Open map</a>`}
+function render(){let r=filtered(),summary=[['Total Transactions',r.length],['Delivered',r.filter(x=>label(x)==='DELIVERED').length],['Non-delivered',r.filter(x=>label(x)==='NON_DELIVERED').length],['Genuine',r.filter(x=>String(x.decision).toUpperCase()==='GENUINE').length],['Not Genuine',r.filter(x=>String(x.decision).toUpperCase().replace('_',' ')==='NOT GENUINE').length],['Compliant',r.filter(x=>x.complianceFlag==='COMPLIANT').length],['Non-compliant',r.filter(x=>x.complianceFlag==='NON_COMPLIANT').length]];$('cards').innerHTML=summary.map(x=>`<div class="card"><div class="label">${x[0]}</div><div class="n">${x[1]}</div></div>`).join('');$('charts').innerHTML=chart('Decision by Count',counts(r,x=>x.decision),'a',false)+chart('Count by Username and Decision',grouped(r,x=>x.decision),'b',true)+chart('Count by Username and Human Detection',grouped(r,x=>human(x.humanDetected)),'c',true)+chart('Count by Username and Status',grouped(r,x=>label(x)),'d',true)+chart('Count by Username and Distance Between Clicks',grouped(r,x=>dist(x.actionToPhotoDistanceMeters)),'e',true);$('recordCount').textContent=`(${r.length} filtered records)`;let visible=tableOpen?r:r.slice(0,12);$('rows').innerHTML=visible.map((x,i)=>`<tr><td>${esc(x.ingestedAt)}</td><td>${esc(x.username)}</td><td>${esc(x.waybill)}</td><td>${esc(label(x))}</td><td>${esc(x.decision)}</td><td>${human(x.humanDetected)}</td><td>${dist(x.actionToPhotoDistanceMeters)}</td><td>${dist(x.actionToBackendDistanceMeters)}</td><td>${dist(x.photoToBackendDistanceMeters)}</td><td>${dist(x.thresholdMeters)}</td><td>${esc(x.validationMode)}</td><td>${esc(x.validationStatus)}</td><td>${esc(x.gpsStatus)}</td><td>${isScan(x)?esc(x.photoAiStatus):quality(x.photoQualityPassed)}</td><td class="${x.complianceFlag==='COMPLIANT'?'good':x.complianceFlag==='NON_COMPLIANT'?'bad':''}">${esc(x.complianceFlag)}</td><td>${esc(x.geoMatchComment)}</td><td>${mapLink(x)}</td><td>${scanTimes(x)}</td><td>${esc(x.scanAttemptId)}${x.isCurrentPodAttempt?" (current POD)":""}</td><td><button onclick="showDetail('${esc(x.eventId)}')">View Details</button></td></tr>`).join('');$('tableToggle').style.display=r.length>12?'block':'none';$('tableToggle').textContent=tableOpen?'Show latest 12 ↑':'Show all transactions ↓'}
+function showDetail(id){let r=all.find(x=>x.eventId===id),fields=['eventId','idempotencyKey','username','courierName','waybill','actionLatitude','actionLongitude','photoLatitude','photoLongitude','expectedLatitude','expectedLongitude','backendLatitude','backendLongitude','actionTimestampIso','actionTimestampEpoch','photoTimestampIso','photoTimestampEpoch','createdAt','syncedAt','ingestedAt','customerName','address','deviceModel','osVersion','appVersion','summary'];$('detailBody').innerHTML=fields.map(k=>`<div><b>${esc(k)}</b><br><span class="muted">${esc(r[k])}</span></div>`).join('');if(isScan(r)){
+const fields=['username','waybill','scanAttemptId','scanToPhotoDistanceMeters','thresholdMeters','gpsValidationResult','gpsValidationReason','photoAiStatus','overallPodStatus','currentPodEventId'];
+$('detailBody').innerHTML='<div><b>Scan-to-Photo GPS Validation</b><br>Proximity verifies scan and photo locations. It does not verify the customer address.</div>'+fields.map(k=>`<div><b>${esc(k)}</b><br>${esc(r[k])}</div>`).join('')+`<div><b>Scan time / Photo time (UTC)</b><br>${scanTimes(r)}</div><div>${mapLink(r)}</div>`;
+for(const [label,p] of [['Scan GPS (Point A)',r.scan?.location],['Photo GPS (Point B)',r.photoLocation]])$('detailBody').innerHTML+=`<div><b>${label}</b><br>${esc(p?JSON.stringify(p):null)}</div>`;
+const history=all.filter(x=>isScan(x)&&x.waybill===r.waybill).sort((a,b)=>b.photoTimestampEpoch-a.photoTimestampEpoch);
+$('detailBody').innerHTML+='<div><b>Scan attempt history</b><br>'+esc(JSON.stringify(r.scanHistory||[]))+'</div><div><b>Photo attempts (latest capture first)</b><br>'+history.map(x=>esc(x.scanAttemptId)+' · '+esc(x.gpsValidationResult)+' · '+esc(x.photoAiStatus)).join('<br>')+'</div>';
+}$('details').showModal()}
 async function load(){let y=scrollY;try{let res=await fetch('/api/pod',{cache:'no-store'});if(!res.ok)throw Error();all=await res.json();let users=[...new Set(all.map(x=>x.username).filter(Boolean))].sort(),statuses=[...new Set(all.map(label).filter(Boolean))].sort(),oldU=val('username'),oldS=val('status');$('username').innerHTML='<option value="">All usernames</option>'+users.map(x=>`<option>${esc(x)}</option>`).join('');$('status').innerHTML='<option value="">All actions/statuses</option>'+statuses.map(x=>`<option>${esc(x)}</option>`).join('');$('username').value=oldU;$('status').value=oldS;render();requestAnimationFrame(()=>scrollTo(0,y))}catch(e){console.warn('Dashboard refresh failed')}}
 ['username','from','to','waybill','status'].forEach(id=>$(id).addEventListener(id==='waybill'?'input':'change',render));$('tableToggle').onclick=()=>{tableOpen=!tableOpen;localStorage.setItem('jneTableOpen',tableOpen);render()};load();setInterval(load,10000);
 </script></body></html>'''
@@ -550,6 +692,9 @@ def _normalize_sdk_config(
         86400,
     )
 
+    mode = gps.get("gpsValidationMode", "LEGACY_DESTINATION")
+    if mode not in ("LEGACY_DESTINATION", "SCAN_TO_PHOTO"):
+        raise ValueError("Invalid GPS validation mode")
     return {
         "delivered": _outcome_policy(incoming.get("delivered", {}), "ALLOW_WITH_PARTIAL_PERSON"),
         "failedDelivery": _outcome_policy(incoming.get("failedDelivery", {})),
@@ -650,6 +795,9 @@ def _normalize_sdk_config(
         },
 
         "gps": {
+            "gpsValidationMode": mode,
+            "maxLocationAgeMillis": _integer(gps, "maxLocationAgeMillis", 30000, 1, 300000),
+            "maxAccuracyMeters": _number(gps, "maxAccuracyMeters", 50.0, 0.01, 1000.0),
             "required": _bool(
                 gps, "required", True
             ),
@@ -690,6 +838,10 @@ def _effective_sdk_config(row: SdkConfiguration) -> dict[str, Any]:
     # Additive read-time defaults support persisted 1.3 rows without deleting data,
     # changing an existing policy value, or creating an unaudited revision.
     config = json.loads(json.dumps(row.configJson))
+    gps = config.setdefault("gps", {})
+    gps.setdefault("gpsValidationMode", "LEGACY_DESTINATION")
+    for key in ("maxLocationAgeMillis", "maxAccuracyMeters"):
+        gps.setdefault(key, DEFAULT_POLICY[key])
     config.setdefault("package", {}).setdefault("awbRequired", True)
     for name, blur in (("delivered", "ALLOW_WITH_PARTIAL_PERSON"), ("failedDelivery", "INHERIT")):
         outcome = config.setdefault(name, {})
@@ -1185,7 +1337,10 @@ a {{
         <div class="card">
             <h2>GPS Validation</h2>
             <div class="description">
-                Configure GPS requirement and allowed delivery radius.
+                Configure GPS requirement and allowed scan/photo radius.
+                <label>GPS validation mode <select id="gpsValidationMode"><option>LEGACY_DESTINATION</option><option>SCAN_TO_PHOTO</option></select></label>
+                <label>Maximum location age (ms) <input id="maxLocationAgeMillis" type="number" min="1" max="300000"></label>
+                <label>Maximum accuracy (m) <input id="maxAccuracyMeters" type="number" min="0.01" max="1000" step="0.01"></label>
             </div>
 
             <div class="row">
@@ -1338,6 +1493,9 @@ function setValue(id, value) {{
 }}
 
 function loadConfig(c) {{
+    setValue("gpsValidationMode", c.gps.gpsValidationMode || "LEGACY_DESTINATION");
+    setValue("maxLocationAgeMillis", c.gps.maxLocationAgeMillis ?? 30000);
+    setValue("maxAccuracyMeters", c.gps.maxAccuracyMeters ?? 50);
     setCheck("awbRequired", c.package.awbRequired ?? true);
     setValue("deliveredBlur", c.delivered?.blurHandling ?? "ALLOW_WITH_PARTIAL_PERSON");
     setValue("failedBlur", c.failedDelivery?.blurHandling ?? "INHERIT");
@@ -1518,6 +1676,9 @@ async function saveConfig() {{
         }},
 
         gps: {{
+            gpsValidationMode: document.getElementById("gpsValidationMode").value,
+            maxLocationAgeMillis: num("maxLocationAgeMillis"),
+            maxAccuracyMeters: num("maxAccuracyMeters"),
             required:
                 checked("gpsRequired"),
 
